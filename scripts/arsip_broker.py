@@ -4,8 +4,9 @@ Cara kerja:
 1. Ambil daftar saham teraktif dari `idx market overview` (bagian "most traded"). Kalau gagal dibaca,
    pakai daftar cadangan dan tulis peringatan di log.
 2. Ambil `idx broker` per kelompok 10 saham, dengan jeda dan percobaan ulang.
-3. Simpan hasil mentah apa adanya. Parser untuk aplikasi dibuat setelah bentuk hasil aslinya terlihat.
-4. Hapus arsip yang lebih tua dari 60 hari.
+3. Simpan ringkas per saham di data/broker/per_saham/KODE.json (satu file berisi riwayat hari-hari terakhir)
+   dan nama broker di data/broker/brokers.json. Aplikasi hanya perlu membaca satu file kecil per saham.
+4. Hari yang lebih tua dari 60 hari dibuang dari tiap file saham.
 
 Mode uji (UJI=1): hanya 5 saham, untuk memastikan IPOT bisa diakses dari server GitHub.
 Keluar dengan kode 1 bila tidak satu pun saham berhasil, supaya Actions berwarna merah.
@@ -88,39 +89,73 @@ def daftar_simbol(uji):
     return CADANGAN, "daftar cadangan"
 
 
+KIND = {"foreign": "A", "local": "L", "state_owned": "B"}  # A = asing, L = lokal, B = BUMN
+
+
+def ringkas(daftar):
+    """[[kode, jenis, lot, nilai, harga rata-rata], ...] supaya file kecil."""
+    return [[b["code"], KIND.get(b.get("kind"), "L"), round(b["lots"]), round(b["value"]), b.get("average_price")]
+            for b in daftar or []]
+
+
+def muat_json(path, bawaan):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return bawaan
+
+
+def simpan_per_saham(item, sekarang, folder, nama_broker):
+    """Tambah atau timpa data satu hari di data/broker/per_saham/KODE.json, lalu buang hari yang terlalu lama."""
+    tgl = str(item.get("to") or item.get("from") or "")
+    if len(tgl) != 10 or not (item.get("buyers") or item.get("sellers")):
+        return False
+    for b in (item.get("buyers") or []) + (item.get("sellers") or []):
+        if b.get("code") and b.get("name"):
+            nama_broker[b["code"]] = b["name"]
+    f = folder / f"{item['symbol']}.json"
+    data = muat_json(f, {"simbol": item["symbol"], "hari": {}})
+    data["nama"] = item.get("name") or data.get("nama", "")
+    data["hari"][tgl] = {"b": ringkas(item.get("buyers")), "s": ringkas(item.get("sellers")),
+                         "fn": item.get("foreign_net_value"), "tv": item.get("total_value"),
+                         "hp": item.get("average_price")}
+    batas = (sekarang - timedelta(days=SIMPAN_HARI)).strftime("%Y-%m-%d")
+    data["hari"] = {k: v for k, v in sorted(data["hari"].items()) if k >= batas}
+    data["dibuat"] = sekarang.isoformat(timespec="seconds")
+    f.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    return True
+
+
 def main():
     LOG.mkdir(exist_ok=True)
     uji = os.environ.get("UJI") == "1"
     sekarang = datetime.now(WIB)
     simbol, sumber = daftar_simbol(uji)
     print(f"{len(simbol)} saham dari {sumber}")
-    batch, gagal = [], []
+    folder = Path("data/broker/per_saham")
+    folder.mkdir(parents=True, exist_ok=True)
+    f_broker = Path("data/broker/brokers.json")
+    nama_broker = muat_json(f_broker, {})
+    tersimpan, kosong, gagal = [], [], []
     for i in range(0, len(simbol), KELOMPOK):
         grup = simbol[i:i + KELOMPOK]
         data, pesan = jalankan(["broker", *grup], f"broker_{i // KELOMPOK + 1}")
         if data is None:
-            gagal.append({"simbol": grup, "pesan": pesan})
+            gagal.append(grup)
             print(f"GAGAL {grup}: {pesan}")
         else:
-            batch.append({"simbol": grup, "hasil": data})
+            for item in (data.get("data") or []):
+                if simpan_per_saham(item, sekarang, folder, nama_broker):
+                    tersimpan.append(item["symbol"])
+                else:
+                    kosong.append(item.get("symbol"))
             print(f"ok {grup}")
         time.sleep(JEDA_DETIK)
-    if not batch:
-        print("Tidak ada saham yang berhasil diambil. Periksa log_broker/ di bagian Artifacts. Mungkin IPOT memblokir server ini.")
+    if not tersimpan:
+        print("Tidak ada saham yang berhasil disimpan. Periksa log_broker/ di bagian Artifacts. Mungkin IPOT memblokir server ini.")
         sys.exit(1)
-    folder = Path("data/broker")
-    folder.mkdir(parents=True, exist_ok=True)
-    nama = folder / f"{sekarang:%Y-%m-%d}{'_uji' if uji else ''}.json"
-    nama.write_text(json.dumps({
-        "tanggal": f"{sekarang:%Y-%m-%d}", "dibuat": sekarang.isoformat(timespec="seconds"),
-        "sumber_daftar": sumber, "simbol": simbol, "batch": batch, "gagal": gagal,
-    }, ensure_ascii=False))
-    print(f"Disimpan: {nama} ({len(batch)} kelompok berhasil, {len(gagal)} gagal)")
-    batas = (sekarang - timedelta(days=SIMPAN_HARI)).strftime("%Y-%m-%d")
-    for f in folder.glob("*.json"):
-        if f.name[:10] < batas:
-            f.unlink()
-            print(f"Dihapus (lebih dari {SIMPAN_HARI} hari): {f.name}")
+    f_broker.write_text(json.dumps(dict(sorted(nama_broker.items())), ensure_ascii=False, separators=(",", ":")))
+    print(f"Tersimpan {len(tersimpan)} saham, kosong {len(kosong)}, kelompok gagal {len(gagal)}")
 
 
 if __name__ == "__main__":
