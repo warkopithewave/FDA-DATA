@@ -1,0 +1,59 @@
+name: Arsip broker summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      uji:
+        description: "Uji cepat: hanya 5 saham (centang), atau 100 saham teraktif (kosongkan)"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "30 9 * * 1-5"   # 16:30 WIB, Senin sampai Jumat
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arsip-broker
+  cancel-in-progress: false
+
+jobs:
+  arsip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pasang idx (fzn0x/idx, lisensi MIT)
+        run: npm install -g github:fzn0x/idx
+
+      - name: Jalankan arsip
+        env:
+          IDX_TIMEOUT_SECS: "30"
+          UJI: ${{ github.event_name == 'workflow_dispatch' && inputs.uji && '1' || '0' }}
+        run: python scripts/arsip_broker.py
+
+      - name: Simpan log mentah (untuk diperiksa bila ada masalah)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-broker
+          path: log_broker/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Simpan hasil ke repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/broker
+          git diff --cached --quiet || git commit -m "Arsip broker $(date +%F)"
+          git push
